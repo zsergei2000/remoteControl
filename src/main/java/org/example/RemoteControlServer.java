@@ -1,59 +1,71 @@
 package org.example;
 
+import net.sourceforge.tess4j.ITessAPI;
+import net.sourceforge.tess4j.ITesseract;
+import net.sourceforge.tess4j.Tesseract;
+import net.sourceforge.tess4j.Word;
+
 import javax.imageio.ImageIO;
 import javax.swing.*;
 import java.awt.*;
-import java.awt.datatransfer.*;
-import java.awt.event.InputEvent;
-import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.List;
 
 public class RemoteControlServer {
 
-    private static final int COMMAND_PORT = 12345;
     private static final int IMAGE_PORT = 12346;
+    private static BufferedImage lastFrame = null;
+    private static long lastImageTime = 0;
+    private static final long IDLE_DELAY_MS = 2000;
+
+    private static JFrame frame;
+    private static JLabel label;
+    private static ITesseract tesseract;
 
     public static void main(String[] args) throws Exception {
-        Robot robot = new Robot();
-
-        JFrame frame = new JFrame("Экран телефона");
-        JLabel label = new JLabel();
+        frame = new JFrame("Экран телефона");
+        label = new JLabel();
         frame.add(label);
-        frame.setSize(800, 600);
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
         frame.setVisible(true);
 
-        // Поток приёма команд
+        tesseract = new Tesseract();
+        tesseract.setDatapath("E:\\Program Files\\Tesseract-OCR\\tessdata");
+        tesseract.setLanguage("heb");
+        tesseract.setOcrEngineMode(ITessAPI.TessOcrEngineMode.OEM_LSTM_ONLY);
+
         new Thread(() -> {
             while (true) {
-                try (ServerSocket commandServer = new ServerSocket(COMMAND_PORT)) {
-                    System.out.println("Ожидание подключения клиента для команд...");
-                    Socket commandSocket = commandServer.accept();
-                    System.out.println("Клиент подключён к командному порту.");
+                try {
+                    Thread.sleep(500);
+                    if (lastFrame != null &&
+                            System.currentTimeMillis() - lastImageTime >= IDLE_DELAY_MS) {
 
-                    BufferedReader in = new BufferedReader(new InputStreamReader(commandSocket.getInputStream()));
-                    String command;
-                    while ((command = in.readLine()) != null) {
-                        processCommand(command, robot);
+                        BufferedImage annotated = annotateHebrewWords(lastFrame, tesseract);
+                        SwingUtilities.invokeLater(() -> {
+                            frame.setSize(annotated.getWidth() + 50, annotated.getHeight() + 100);
+                            label.setIcon(new ImageIcon(annotated));
+                        });
+
+                        lastImageTime = System.currentTimeMillis();
                     }
-                } catch (IOException e) {
-                    System.err.println("Ошибка командного соединения: " + e.getMessage());
-                    try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
-                }
+                } catch (InterruptedException ignored) {}
             }
         }).start();
 
-        // Поток приёма изображений
-        while (true) {
-            try (ServerSocket imageServer = new ServerSocket(IMAGE_PORT)) {
-                System.out.println("Ожидание подключения клиента для изображений...");
-                Socket imageSocket = imageServer.accept();
-                System.out.println("Клиент подключён к порту изображений.");
+        try (ServerSocket imageServer = new ServerSocket(IMAGE_PORT)) {
+            System.out.println("Ожидание подключения клиента для изображений...");
 
-                DataInputStream dataInputStream = new DataInputStream(imageSocket.getInputStream());
+            while (true) {
+                Socket imageSocket = imageServer.accept();
+                System.out.println("Клиент подключён.");
+
+                DataInputStream dataInputStream = new DataInputStream(
+                        new BufferedInputStream(imageSocket.getInputStream())
+                );
 
                 while (true) {
                     int length;
@@ -69,51 +81,68 @@ public class RemoteControlServer {
                     byte[] imageBytes = new byte[length];
                     dataInputStream.readFully(imageBytes);
 
-                    BufferedImage img = ImageIO.read(new ByteArrayInputStream(imageBytes));
-                    if (img != null) {
-                        Image scaled = img.getScaledInstance(label.getWidth(), label.getHeight(), Image.SCALE_SMOOTH);
-                        label.setIcon(new ImageIcon(scaled));
-                        frame.repaint();
-                    }
+                    BufferedImage raw = ImageIO.read(new ByteArrayInputStream(imageBytes));
+                    if (raw == null) continue;
+
+                    BufferedImage current = new BufferedImage(
+                            raw.getWidth(),
+                            raw.getHeight(),
+                            BufferedImage.TYPE_3BYTE_BGR
+                    );
+                    Graphics2D g2d = current.createGraphics();
+                    g2d.drawImage(raw, 0, 0, null);
+                    g2d.dispose();
+
+                    lastFrame = current;
+                    lastImageTime = System.currentTimeMillis();
+
+                    SwingUtilities.invokeLater(() -> {
+                        frame.setSize(current.getWidth() + 50, current.getHeight() + 100);
+                        label.setIcon(new ImageIcon(current));
+                    });
                 }
-            } catch (IOException e) {
-                System.err.println("Ошибка приёма изображения: " + e.getMessage());
-                try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
             }
         }
     }
 
-    private static void processCommand(String command, Robot robot) {
+    private static BufferedImage annotateHebrewWords(BufferedImage image, ITesseract tesseract) {
+        BufferedImage copy = new BufferedImage(
+                image.getWidth(),
+                image.getHeight(),
+                BufferedImage.TYPE_3BYTE_BGR
+        );
+
+        Graphics2D g = copy.createGraphics();
+        g.drawImage(image, 0, 0, null);
+        g.setColor(Color.YELLOW);
+        g.setStroke(new BasicStroke(3));
+
         try {
-            if (command.startsWith("MOVE")) {
-                String[] parts = command.split(" ");
-                int x = Integer.parseInt(parts[1]);
-                int y = Integer.parseInt(parts[2]);
-                robot.mouseMove(x, y);
-            } else if (command.startsWith("CLICK")) {
-                robot.mousePress(InputEvent.BUTTON1_DOWN_MASK);
-                robot.mouseRelease(InputEvent.BUTTON1_DOWN_MASK);
-            } else if (command.startsWith("TYPE")) {
-                String text = command.substring(5);
-                for (char c : text.toCharArray()) {
-                    int keyCode = KeyEvent.getExtendedKeyCodeForChar(c);
-                    if (KeyEvent.CHAR_UNDEFINED == keyCode) continue;
-                    robot.keyPress(keyCode);
-                    robot.keyRelease(keyCode);
+            List<Word> words = tesseract.getWords(image, ITessAPI.TessPageIteratorLevel.RIL_WORD);
+            for (Word word : words) {
+                String text = word.getText().trim();
+                if (!text.isEmpty() && containsHebrew(text)) {
+                    Rectangle rect = word.getBoundingBox();
+                    g.drawRect(rect.x, rect.y, rect.width, rect.height);
+
+                    // 🟡 Выводим слово в консоль
+                    System.out.println("🟨 [HEBREW] → " + text);
                 }
-            } else if (command.startsWith("PASTE")) {
-                String text = command.substring(6);
-                StringSelection selection = new StringSelection(text);
-                Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-                clipboard.setContents(selection, null);
-                robot.keyPress(KeyEvent.VK_CONTROL);
-                robot.keyPress(KeyEvent.VK_V);
-                robot.keyRelease(KeyEvent.VK_V);
-                robot.keyRelease(KeyEvent.VK_CONTROL);
             }
         } catch (Exception e) {
-            System.err.println("Ошибка обработки команды: " + command);
-            e.printStackTrace();
+            System.err.println("OCR error: " + e.getMessage());
         }
+
+        g.dispose();
+        return copy;
+    }
+
+    private static boolean containsHebrew(String text) {
+        for (char c : text.toCharArray()) {
+            if (Character.UnicodeBlock.of(c) == Character.UnicodeBlock.HEBREW) {
+                return true;
+            }
+        }
+        return false;
     }
 }
